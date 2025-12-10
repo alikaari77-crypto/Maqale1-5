@@ -1,0 +1,473 @@
+# flowmat_flow.py
+# پیاده‌سازی پایتونی (PyTorch) تقریبی از معماری FlowMat (مناسب برای اجرا و تست اولیه)
+# نویسنده: ChatGPT (برای استفاده و انتشار در GitHub)
+# توضیح: این کد یک بازسازی مفهومی از مقاله است نه یک کپی خط‌به‌خط. برای نتایج نهایی باید دیتاست اصلی را جایگزین کنید.
+
+import os
+import math
+import time
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.metrics.pairwise import cosine_similarity
+
+# -------------------
+# تنظیمات کلی
+# -------------------
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+# -------------------
+# ابزارهای کمکی
+# -------------------
+def nmse_db(y_true, y_pred, eps=1e-12):
+    # y_true, y_pred: complex-like real-imag concatenated or real arrays
+    num = np.sum((y_true - y_pred) ** 2)
+    den = np.sum(y_true ** 2) + eps
+    nmse = num / den
+    return 10 * np.log10(nmse + 1e-18)
+
+def cosine_metric_batch(y_true, y_pred):
+    # compute average cosine similarity per-sample (flatten inner dim)
+    # expects real vectors
+    sim = cosine_similarity(y_true.reshape(y_true.shape[0], -1),
+                            y_pred.reshape(y_pred.shape[0], -1))
+    # cosine_similarity returns matrix; diagonal is per sample similarity
+    diag = np.diag(sim)
+    return np.mean(diag)
+
+# -------------------
+# دیتاست مثال / loader
+# -------------------
+class SyntheticCSIDataset(Dataset):
+    """
+    دیتاست مصنوعی برای تست:
+    - eigenvectors / CSI شبیه به مقاله:
+      dims: (num_samples, Nc, Nt) برای eigenvectors (مقادیر حقیقی و موهومی)
+    - یا pilot / partial inputs با نویز
+    این دیتاست دو خروجی می‌دهد: pilots و full eigenvectors (هر دو real-imag concatenated)
+    """
+    def __init__(self, num_samples=2000, Nc=13, Nt=32, complex_split=True, noise_sigma=0.1, pilot_rate=0.46):
+        super().__init__()
+        self.num_samples = num_samples
+        self.Nc = Nc  # number of subcarriers (tokens)
+        self.Nt = Nt  # antenna dimension per token
+        self.noise_sigma = noise_sigma
+        self.pilot_rate = pilot_rate  # fraction of tokens present in pilot (for simulating low/high density)
+        self.complex_split = complex_split
+        # generate synthetic eigenvectors: shape (num_samples, Nc, Nt)
+        # distribution: correlated Gaussian in frequency
+        base = np.random.randn(num_samples, Nc, Nt) * 0.5
+        # add correlation across neighboring subcarriers
+        for i in range(1, Nc):
+            base[:, i, :] += 0.6 * base[:, i - 1, :]
+        # optionally normalized vectors (like eigenvectors)
+        norms = np.linalg.norm(base, axis=2, keepdims=True) + 1e-9
+        base = base / norms
+        # create imaginary part for "complex" behaviour
+        imag = np.random.randn(*base.shape) * 0.2
+        full_complex = base + 1j * imag
+        # store as real-imag concatenated
+        self.labels = np.concatenate([full_complex.real, full_complex.imag], axis=-1)  # shape (num, Nc, 2*Nt)
+        # generate pilots: subset of tokens + noise; represent as smaller Nc_p x Nt (simulate pilot sampling)
+        self.pilot_mask = (np.random.rand(num_samples, Nc) < self.pilot_rate).astype(np.float32)
+        # create pilot arrays: masked labels plus noise and zero where no pilot
+        self.pilots = np.zeros_like(self.labels)
+        for n in range(num_samples):
+            mask = self.pilot_mask[n]  # length Nc
+            for k in range(Nc):
+                if mask[k] > 0.5:
+                    noisy = self.labels[n, k, :] + np.random.randn(self.labels.shape[-1]) * noise_sigma
+                    self.pilots[n, k, :] = noisy
+                else:
+                    self.pilots[n, k, :] = 0.0
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        # return pilots and labels as float32 arrays
+        pilot = self.pilots[idx].astype(np.float32)  # shape (Nc, 2*Nt)
+        label = self.labels[idx].astype(np.float32)  # shape (Nc, 2*Nt)
+        return pilot, label
+
+# -------------------
+# بلاک‌های مدل
+# -------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=512):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model % 2 == 1:
+            # odd case
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # 1 x max_len x d_model
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: B x N x d_model
+        n = x.size(1)
+        return x + self.pe[:, :n, :].to(x.device)
+
+class SimpleTransformerBlock(nn.Module):
+    def __init__(self, d_model, nhead=8, dim_feedforward=512, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Linear(dim_feedforward, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None):
+        # x: B x N x d
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask)
+        x = x + self.dropout(attn_out)
+        x = self.norm1(x)
+        ff_out = self.ff(x)
+        x = x + self.dropout(ff_out)
+        x = self.norm2(x)
+        return x
+
+class MaskAttentionBlock(SimpleTransformerBlock):
+    """
+    بلاکی مشابه Mat در مقاله که ماسک attention را اعمال می‌کند.
+    ما از attn_mask استفاده می‌کنیم تا اجازه ندهیم برخی توکن‌ها روی ماسک تأثیر بگذارند.
+    توجه: MultiheadAttention در PyTorch از attn_mask expects shape (B*nhead?) or (N,N); 
+    برای سادگی از key_padding_mask یا از طریق افزودن large negative به attention scores استفاده می‌کنیم.
+    این نسخه ساده‌شده است.
+    """
+    def __init__(self, d_model, nhead=8, dim_feedforward=512, dropout=0.1):
+        super().__init__(d_model, nhead, dim_feedforward, dropout)
+
+    # inherits forward; attn_mask param passthrough
+
+# -------------------
+# FlowMat Encoder / Decoder (ساده شده)
+# -------------------
+class FlowMatEncoder(nn.Module):
+    def __init__(self, input_dim, d_model=256, n_layers=4, nhead=8, token_reduce=None):
+        """
+        input_dim: dimension per token (مثلاً 2*Nt)
+        d_model: embedding dim
+        token_reduce: if not None, number of tokens to keep (m in مقاله)
+        """
+        super().__init__()
+        self.input_dim = input_dim
+        self.d_model = d_model
+        self.token_reduce = token_reduce
+        self.embed = nn.Linear(input_dim, d_model)
+        self.pos = PositionalEncoding(d_model, max_len=1024)
+        self.blocks = nn.ModuleList([MaskAttentionBlock(d_model, nhead=nhead, dim_feedforward=4*d_model) for _ in range(n_layers)])
+        # special mask propagation projection (M' path)
+        self.mask_proj = nn.Linear(d_model, d_model)
+
+        # learnable query vector Q_phi for selecting tokens (like in paper)
+        # we'll learn a vector of length Nc (max tokens) but to be generic we use a small MLP to produce scores per token
+        self.query_mlp = nn.Sequential(
+            nn.Linear(d_model, d_model//2),
+            nn.ReLU(),
+            nn.Linear(d_model//2, 1)
+        )
+
+    def forward(self, x, mask=None):
+        """
+        x: B x Nc x input_dim
+        mask: B x Nc boolean mask where 1 means token present (pilot) and 0 means missing
+        returns:
+          Z: B x Nc x d_model  (latent per token)
+          Zpart: B x m x d_model  (selected subset if token_reduce set, else same as Z)
+          idx_selected: indices selected (B x m) or None
+        """
+        B, Nc, _ = x.shape
+        x_emb = self.embed(x)  # B x Nc x d_model
+        x_emb = self.pos(x_emb)
+        # pass through transformer blocks; we will optionally use mask to influence attention by key_padding_mask
+        out = x_emb
+        key_padding_mask = None
+        if mask is not None:
+            # mask: B x Nc (1 present, 0 missing). MultiheadAttention expects True for padding positions.
+            # we want to treat missing tokens as "padding" so attention ignores them.
+            key_padding_mask = (mask == 0)  # True where padding
+        for blk in self.blocks:
+            out = blk(out, attn_mask=None)  # key_padding_mask not supported here easily, but we simplify
+        Z = out  # B x Nc x d_model
+
+        # compute query scores per token from Z (mean over dim maybe)
+        scores = self.query_mlp(Z).squeeze(-1)  # B x Nc
+        # optionally set very low score for masked tokens so they are not selected
+        if mask is not None:
+            scores = scores + (mask - 1.0) * 1e6  # masked tokens get -inf effectively
+        # select top-k tokens per sample if token_reduce provided
+        if self.token_reduce is None or self.token_reduce >= Nc:
+            Zpart = Z
+            idx_selected = None
+        else:
+            k = self.token_reduce
+            idx_selected = torch.topk(scores, k=k, dim=1).indices  # B x k
+            # gather Z at idx_selected
+            batch_idx = torch.arange(B, device=Z.device).unsqueeze(1).expand(-1, k)
+            Zpart = Z[batch_idx, idx_selected, :]  # B x k x d_model
+
+        return Z, Zpart, idx_selected
+
+class FlowMatDecoder(nn.Module):
+    def __init__(self, d_model=256, output_dim=64, n_layers=4, nhead=8, mask_token=True):
+        """
+        output_dim: dimension per token to reconstruct (مثلاً 2*Nt)
+        """
+        super().__init__()
+        self.d_model = d_model
+        self.mask_token_flag = mask_token
+        # learnable mask token vector (shared)
+        self.mask_token = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pos = PositionalEncoding(d_model, max_len=1024)
+        self.blocks = nn.ModuleList([SimpleTransformerBlock(d_model, nhead=nhead, dim_feedforward=4*d_model) for _ in range(n_layers)])
+        self.head = nn.Linear(d_model, output_dim)
+
+    def forward(self, Zpart, idx_selected, Nc):
+        """
+        Zpart: B x k x d_model (selected subset)
+        idx_selected: B x k indices of selected tokens
+        Nc: target number of tokens to reconstruct
+        returns:
+          X_recon: B x Nc x output_dim
+        """
+        B, k, d = Zpart.shape
+        # initialize full latent by filling with mask tokens
+        mask_tokens = self.mask_token.expand(B, Nc, d).clone()  # B x Nc x d
+        # place Zpart at indices idx_selected positions
+        if idx_selected is not None:
+            # idx_selected: B x k
+            batch_idx = torch.arange(B, device=Zpart.device).unsqueeze(1).expand(-1, k)
+            mask_tokens[batch_idx, idx_selected, :] = Zpart
+        else:
+            # no selection: assume Zpart is full
+            mask_tokens = Zpart
+        x = self.pos(mask_tokens)
+        for blk in self.blocks:
+            x = blk(x)
+        out = self.head(x)  # B x Nc x output_dim
+        return out
+
+# -------------------
+# Denoiser سبک (MLP-Mixer ساده)
+# -------------------
+class SimpleDenoiser(nn.Module):
+    def __init__(self, input_dim, hidden_dim=512):
+        super().__init__()
+        # pixel-wise MLP denoiser: processes each token separately
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim)
+        )
+
+    def forward(self, x):
+        # x: B x Nc x D
+        B, Nc, D = x.shape
+        out = self.net(x)  # B x Nc x D
+        return out
+
+# -------------------
+# FlowMat کامل و wrapper برای estimation+feedback
+# -------------------
+class FlowMatModel(nn.Module):
+    def __init__(self, token_dim, d_model=256, enc_layers=4, dec_layers=4, nhead=8, token_reduce=6):
+        """
+        token_dim: input/output dim per token (مثلاً 2*Nt)
+        token_reduce: m (number of tokens to keep) -- سوپراپارامتر
+        """
+        super().__init__()
+        self.encoder = FlowMatEncoder(input_dim=token_dim, d_model=d_model, n_layers=enc_layers, nhead=nhead, token_reduce=token_reduce)
+        self.decoder = FlowMatDecoder(d_model=d_model, output_dim=token_dim, n_layers=dec_layers, nhead=nhead)
+        self.denoiser = SimpleDenoiser(input_dim=token_dim, hidden_dim=token_dim*4)
+
+    def forward(self, pilot, pilot_mask=None):
+        """
+        pilot: B x Nc x token_dim  (noisy pilots with zeros for missing tokens)
+        pilot_mask: B x Nc array 1/0 indicating which tokens exist
+        returns:
+          recon: B x Nc x token_dim  (reconstructed full eigenvectors / CSI)
+        """
+        Z, Zpart, idx = self.encoder(pilot, mask=pilot_mask)
+        # decoder reconstruct
+        recon = self.decoder(Zpart, idx, Nc=pilot.shape[1])
+        # denoise step (as in paper, decoder used for completion + MLP denoise)
+        recon = self.denoiser(recon)
+        return recon
+
+# -------------------
+# توابع آموزش و ارزیابی
+# -------------------
+def train_one_epoch(model, dataloader, opt, device=DEVICE):
+    model.train()
+    total_loss = 0.0
+    for pilots, labels in tqdm(dataloader, desc="Train batches", leave=False):
+        pilots = pilots.to(device)
+        labels = labels.to(device)
+        # pilot_mask: nonzero rows
+        pilot_mask = (torch.sum(torch.abs(pilots), dim=-1) > 0.0).float().to(device)
+        opt.zero_grad()
+        recon = model(pilots, pilot_mask)
+        # loss: NMSE (we use MSE normalized by label power)
+        mse = F.mse_loss(recon, labels, reduction='none')
+        denom = torch.sum(labels ** 2, dim=[1,2], keepdim=True) + 1e-9
+        nmse = torch.sum(mse, dim=[1,2], keepdim=True) / denom
+        loss = torch.mean(nmse)
+        loss.backward()
+        opt.step()
+        total_loss += loss.item() * pilots.size(0)
+    return total_loss / len(dataloader.dataset)
+
+def evaluate_model(model, dataloader, device=DEVICE):
+    model.eval()
+    all_nmse_db = []
+    all_cosine = []
+    recon_examples = []
+    with torch.no_grad():
+        for pilots, labels in tqdm(dataloader, desc="Eval batches", leave=False):
+            pilots = pilots.to(device)
+            labels = labels.to(device)
+            pilot_mask = (torch.sum(torch.abs(pilots), dim=-1) > 0.0).float().to(device)
+            recon = model(pilots, pilot_mask)
+            # compute nmse in dB per sample
+            recon_np = recon.detach().cpu().numpy()
+            labels_np = labels.detach().cpu().numpy()
+            for i in range(recon_np.shape[0]):
+                nmse_val = nmse_db(labels_np[i], recon_np[i])
+                all_nmse_db.append(nmse_val)
+            # cosine: flatten per sample using real vectors
+            cos_val = cosine_metric_batch(labels_np, recon_np)
+            all_cosine.append(cos_val)
+            # save first batch examples to visualize
+            recon_examples.append((pilots.detach().cpu().numpy(), labels_np, recon_np))
+    mean_nmse_db = float(np.mean(all_nmse_db))
+    mean_cos = float(np.mean(all_cosine))
+    return mean_nmse_db, mean_cos, recon_examples[:2]
+
+# -------------------
+# ابزارهای ذخیره تصویر / نمایش یک نمونه
+# -------------------
+def save_sample_plots(outdir, pilots, labels, recon, sample_id=0):
+    """
+    pilots, labels, recon: numpy arrays B x Nc x D
+    این تابع برای یک نمونه چند نمودار می‌سازد: نمایش توکن ها (واقعی vs بازسازی) برای چند کانال منتخب
+    """
+    os.makedirs(outdir, exist_ok=True)
+    # انتخاب نمونه
+    p = pilots[sample_id]
+    gt = labels[sample_id]
+    rc = recon[sample_id]
+    Nc, D = gt.shape
+    # نمایش یک کانال (مثلاً channel index 0..min(6, Nt-1))
+    # چون داده‌های ما concatenated real+imag طول D = 2*Nt، برای نمایش یک آنتن خاص می‌توانیم real و imag جدا کنیم
+    Nt = D // 2
+    # رسم مقایسه: برای چند subcarrier (token) نشان دهیم مقادیر real بخش اول آنتن 0
+    # انتخاب 4 subcarrier تصادفی
+    idxs = list(range(0, Nc, max(1, Nc//6)))[:6]
+    fig, axes = plt.subplots(2, len(idxs), figsize=(3*len(idxs), 5))
+    for j, k in enumerate(idxs):
+        axes[0, j].plot(gt[k, :Nt], label='GT real (all antennas concatenated[:Nt])')
+        axes[0, j].plot(rc[k, :Nt], linestyle='--', label='Recon real')
+        axes[0, j].set_title(f"Subcarrier {k} (real part)")
+        axes[0, j].legend(fontsize=6)
+        axes[1, j].plot(gt[k, Nt:], label='GT imag')
+        axes[1, j].plot(rc[k, Nt:], linestyle='--', label='Recon imag')
+        axes[1, j].set_title(f"Subcarrier {k} (imag part)")
+        axes[1, j].legend(fontsize=6)
+    plt.tight_layout()
+    fpath = os.path.join(outdir, f"recon_sample_{sample_id}.png")
+    plt.savefig(fpath, dpi=150)
+    plt.close(fig)
+    return fpath
+
+# -------------------
+# تابع اصلی اجرا و آموزش نمونه
+# -------------------
+def run_training_demo(save_dir="flowmat_outputs", epochs=6, batch_size=32, use_synthetic=True):
+    os.makedirs(save_dir, exist_ok=True)
+    # پارامترهای دیتاست مشابه مقاله (برای eigenvectors: Nc=13, Nt=32)
+    if use_synthetic:
+        dataset = SyntheticCSIDataset(num_samples=2000, Nc=13, Nt=32, noise_sigma=0.06, pilot_rate=0.46)
+        valset = SyntheticCSIDataset(num_samples=300, Nc=13, Nt=32, noise_sigma=0.06, pilot_rate=0.46)
+    else:
+        raise NotImplementedError("Please implement real dataset loader and set use_synthetic=False")
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(valset, batch_size=batch_size, shuffle=False, num_workers=0)
+
+    token_dim = dataset.labels.shape[-1]  # 2*Nt
+    model = FlowMatModel(token_dim=token_dim, d_model=256, enc_layers=4, dec_layers=4, nhead=8, token_reduce=6)
+    model = model.to(DEVICE)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
+
+    best_nmse = 1e9
+    history = {"train_loss": [], "val_nmse_db": [], "val_cosine": []}
+    for ep in range(1, epochs+1):
+        t0 = time.time()
+        train_loss = train_one_epoch(model, train_loader, optimizer, device=DEVICE)
+        nmse_db_val, cos_val, examples = evaluate_model(model, val_loader, device=DEVICE)
+        scheduler.step()
+        t1 = time.time()
+        print(f"[Epoch {ep}] train_loss={train_loss:.6f} | val_NMSE(dB)={nmse_db_val:.3f} | val_cos={cos_val:.4f} | time={t1-t0:.1f}s")
+        history["train_loss"].append(train_loss)
+        history["val_nmse_db"].append(nmse_db_val)
+        history["val_cosine"].append(cos_val)
+        # save best
+        if nmse_db_val < best_nmse:
+            best_nmse = nmse_db_val
+            torch.save(model.state_dict(), os.path.join(save_dir, "best_flowmat.pth"))
+        # save sample plots
+        # examples is list of tuples (pilots, labels, recon) for some batches
+        try:
+            p, l, r = examples[0]
+            imgpath = save_sample_plots(save_dir, p, l, r, sample_id=0)
+            print("Saved sample recon plot ->", imgpath)
+        except Exception as e:
+            print("Warning: couldn't save sample plot:", e)
+
+    # save history plots
+    plt.figure()
+    plt.plot(history["train_loss"], label="train_loss")
+    plt.xlabel("epoch"); plt.ylabel("loss"); plt.legend()
+    plt.tight_layout(); plt.savefig(os.path.join(save_dir, "train_loss.png")); plt.close()
+
+    plt.figure()
+    plt.plot(history["val_nmse_db"], label="val_NMSE(dB)")
+    plt.xlabel("epoch"); plt.ylabel("NMSE(dB)"); plt.legend()
+    plt.tight_layout(); plt.savefig(os.path.join(save_dir, "val_nmse_db.png")); plt.close()
+
+    plt.figure()
+    plt.plot(history["val_cosine"], label="val_cosine")
+    plt.xlabel("epoch"); plt.ylabel("cosine"); plt.legend()
+    plt.tight_layout(); plt.savefig(os.path.join(save_dir, "val_cosine.png")); plt.close()
+
+    print("Training finished. Best NMSE(dB):", best_nmse)
+    print("Saved artifacts in", save_dir)
+    return model, history
+
+# -------------------
+# اجرای نمونه (اگر مستقیم این فایل را اجرا کنی)
+# -------------------
+if __name__ == '__main__':
+    # توجه: روی گوشی اجرای کامل آموزش ممکن است طول بکشد.
+    # برای تست سریع می‌توان epochs را به 1-2 کاهش داد.
+    model, history = run_training_demo(save_dir="flowmat_outputs", epochs=4, batch_size=48, use_synthetic=True)
